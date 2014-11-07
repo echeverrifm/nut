@@ -43,13 +43,14 @@ static int	bestups_process_bbb_status_bit(item_t *item, char *value, size_t valu
 static int	bestups_manufacturer(item_t *item, char *value, size_t valuelen);
 static int	bestups_model(item_t *item, char *value, size_t valuelen);
 static int	bestups_batt_runtime(item_t *item, char *value, size_t valuelen);
+static int	bestups_batt_packs(item_t *item, char *value, size_t valuelen);
 static int	bestups_get_pins_shutdown_mode(item_t *item, char *value, size_t valuelen);
 
 /* ups.conf settings */
 static int	pins_shutdown_mode;
 
 /* General settings */
-static int	inverted_bypass_bit = 0;
+static int	inverted_bbb_bit = 0;
 
 
 /* == Ranges/enums == */
@@ -96,13 +97,13 @@ static item_t	bestups_qx2nut[] = {
 	/* Status bits */
 	{ "ups.status",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	38,	38,	NULL,	QX_FLAG_QUICK_POLL,	NULL,	blazer_process_status_bits },		/* Utility Fail (Immediate) */
 	{ "ups.status",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	39,	39,	NULL,	QX_FLAG_QUICK_POLL,	NULL,	blazer_process_status_bits },		/* Battery Low */
-	{ "ups.status",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	40,	40,	NULL,	QX_FLAG_QUICK_POLL,	NULL,	bestups_process_bbb_status_bit },	/* Bypass/Boost or Buck Active */
 	{ "ups.alarm",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	41,	41,	NULL,	0,			NULL,	blazer_process_status_bits },		/* UPS Failed */
 	{ "ups.type",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	42,	42,	"%s",	QX_FLAG_STATIC,		NULL,	blazer_process_status_bits },		/* UPS Type */
 	{ "ups.status",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	43,	43,	NULL,	QX_FLAG_QUICK_POLL,	NULL,	blazer_process_status_bits },		/* Test in Progress */
 	{ "ups.alarm",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	44,	44,	NULL,	0,			NULL,	blazer_process_status_bits },		/* Shutdown Active */
 	{ "ups.status",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	44,	44,	NULL,	QX_FLAG_QUICK_POLL,	NULL,	blazer_process_status_bits },		/* Shutdown Active */
-	{ "ups.beeper.status",		0,	NULL,	"Q1\r",	"",	47,	'(',	"",	45,	45,	"%s",	0,			NULL,	blazer_process_status_bits },		/* Beeper status */
+/*	{ "ups.beeper.status",		0,	NULL,	"Q1\r",	"",	47,	'(',	"",	45,	45,	"%s",	0,			NULL,	blazer_process_status_bits },		*//* Beeper status: not supported; always 0 */
+	{ "ups.status",			0,	NULL,	"Q1\r",	"",	47,	'(',	"",	40,	40,	NULL,	QX_FLAG_QUICK_POLL,	NULL,	bestups_process_bbb_status_bit },	/* Bypass/Boost or Buck Active - keep this one at the end as it needs the processed data from the previous items */
 
 	/* Query UPS for ratings and model infos
 	 * > [ID\r]
@@ -138,7 +139,7 @@ static item_t	bestups_qx2nut[] = {
 	 *    0
 	 */
 
-	{ "battery.packs",	ST_FLAG_RW,	bestups_r_batt_packs,	"BP?\r",	"",	3,	0,	"",	0,	1,	"%.0f",	QX_FLAG_SEMI_STATIC | QX_FLAG_RANGE | QX_FLAG_SKIP,	NULL,	NULL },
+	{ "battery.packs",	ST_FLAG_RW,	bestups_r_batt_packs,	"BP?\r",	"",	3,	0,	"",	0,	1,	"%d",	QX_FLAG_SEMI_STATIC | QX_FLAG_RANGE | QX_FLAG_SKIP,	NULL,	bestups_batt_packs },
 
 	/* Set number of battery packs to n (integer, 0-5) (available only on the Axxium/Sola 620 model series)
 	 * > [BPn\r]
@@ -162,6 +163,15 @@ static item_t	bestups_qx2nut[] = {
 	 */
 
 	{ "pins_shutdown_mode",	0,		bestups_r_pins_shutdown_mode,	"SS%.0f\r",	"",	0,	0,	"",	0,	0,	NULL,	QX_FLAG_SETVAR | QX_FLAG_RANGE | QX_FLAG_NONUT | QX_FLAG_SKIP,		NULL,	bestups_process_setvar },
+
+	/* Query UPS for ??
+	 * > [M\r]
+	 * < [0\r]
+	 *    01
+	 *    0
+	 */
+
+	{ "unknown.1",		0,	NULL,	"M\r",	"",	2,	0,	"",	0,	0,	"%s",	QX_FLAG_QUICK_POLL,	NULL,	NULL },
 
 	/* Instant commands */
 	{ "shutdown.return",		0,	NULL,	"S%s\r",	"",	0,	0,	"",	0,	0,	NULL,	QX_FLAG_CMD,	NULL,	blazer_process_command },
@@ -191,6 +201,7 @@ static testing_t	bestups_testing[] = {
 	{ "BP1\r",	"",	-1 },
 	{ "SS?\r",	"0\r",	-1 },
 	{ "SS2\r",	"",	-1 },
+	{ "M\r",	"0\r",	-1 },
 	{ "S03\r",	"",	-1 },
 	{ "C\r",	"",	-1 },
 	{ "S02R0005\r",	"",	-1 },
@@ -343,7 +354,18 @@ static int	bestups_process_setvar(item_t *item, char *value, size_t valuelen)
 /* Bypass/Boost or Buck status */
 static int	bestups_process_bbb_status_bit(item_t *item, char *value, size_t valuelen)
 {
-	if (inverted_bypass_bit) {
+	/* Bypass/Boost/Buck bit is not reliable when a battery test, shutdown or on battery condition occurs: always ignore it in these cases */
+	if (!(qx_status() & STATUS(OL)) || (qx_status() & (STATUS(CAL) | STATUS(FSD)))) {
+
+		if (item->value[0] == '1')
+			item->value[0] = '0';
+
+		return blazer_process_status_bits(item, value, valuelen);
+
+	}
+
+	/* UPSes with inverted bypass/boost/buck bit */
+	if (inverted_bbb_bit) {
 
 		if (item->value[0] == '1')
 			item->value[0] = '0';
@@ -408,12 +430,12 @@ static int	bestups_model(item_t *item, char *value, size_t valuelen)
 	} else if (!strcmp(item->value, "PR2")) {
 
 		snprintf(value, valuelen, item->dfl, "Patriot Pro II");
-		inverted_bypass_bit = 1;
+		inverted_bbb_bit = 1;
 
 	} else if (!strcmp(item->value, "PRO")) {
 
 		snprintf(value, valuelen, item->dfl, "Patriot Pro");
-		inverted_bypass_bit = 1;
+		inverted_bbb_bit = 1;
 
 	/* Sola Australia devices */
 	} else if (
@@ -460,14 +482,6 @@ static int	bestups_model(item_t *item, char *value, size_t valuelen)
 
 		unskip->qxflags &= ~QX_FLAG_SKIP;
 
-		unskip = find_nut_info("battery.packs", QX_FLAG_SETVAR, 0);
-
-		/* Don't know what happened */
-		if (!unskip)
-			return -1;
-
-		unskip->qxflags &= ~QX_FLAG_SKIP;
-
 	}
 
 	return 0;
@@ -491,7 +505,31 @@ static int	bestups_batt_runtime(item_t *item, char *value, size_t valuelen)
 	return 0;
 }
 
-/* *SETVAR/NONUT* Get shutdown mode functionality of Pin 1 and Pin 7 on the UPS DB9 communication port (Per Best Power’s EPS-0059) as set in the UPS */
+/* Battery packs */
+static int	bestups_batt_packs(item_t *item, char *value, size_t valuelen)
+{
+	item_t	*unskip;
+
+	if (strspn(item->value, "0123456789 ") != strlen(item->value)) {
+		upsdebugx(2, "%s: non numerical value [%s: %s]", __func__, item->info_type, item->value);
+		return -1;
+	}
+
+	snprintf(value, valuelen, item->dfl, strtol(item->value, NULL, 10));
+
+	/* Unskip battery.packs setvar */
+	unskip = find_nut_info("battery.packs", QX_FLAG_SETVAR, 0);
+
+	/* Don't know what happened */
+	if (!unskip)
+		return -1;
+
+	unskip->qxflags &= ~QX_FLAG_SKIP;
+
+	return 0;
+}
+
+/* *NONUT* Get shutdown mode functionality of Pin 1 and Pin 7 on the UPS DB9 communication port (Per Best Power’s EPS-0059) as set in the UPS */
 static int	bestups_get_pins_shutdown_mode(item_t *item, char *value, size_t valuelen)
 {
 	item_t	*unskip;
